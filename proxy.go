@@ -21,67 +21,64 @@ import (
 	"github.com/gorilla/mux"
 )
 
-type RequestRecord struct {
-	ID                 int
-	Method             string
-	URL                string
-	RequestHeaders     http.Header
-	RequestBody        []byte
-	ResponseStatus     string
-	ResponseStatusCode int
-	ResponseHeaders    http.Header
-	ResponseBody       []byte
-	Timestamp          time.Time
-	IsHTTPS            bool
-}
-
 type Storage struct {
-	mu       sync.RWMutex
-	requests []RequestRecord
-	nextID   int
+	mu sync.RWMutex
+	db *DB
 }
 
-func (s *Storage) Add(r *http.Request, reqBody []byte, resp *http.Response, respBody []byte, isHTTPS bool) int {
+func NewStorage() (*Storage, error) {
+	db, err := NewDB()
+	if err != nil {
+		return nil, err
+	}
+
+	if err = db.Init(); err != nil {
+		return nil, err
+	}
+
+	return &Storage{db: db}, nil
+}
+
+func (s *Storage) Add(r *http.Request, reqBody []byte, resp *http.Response, respBody []byte, isHTTPS bool) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	cleanedHeaders := r.Header.Clone()
-	cleanedHeaders.Del("Proxy-Connection")
-	cleanedHeaders.Del("Proxy-Authorization")
-
-	record := RequestRecord{
-		ID:                 s.nextID,
-		Method:             r.Method,
-		URL:                r.URL.String(),
-		RequestHeaders:     cleanedHeaders,
-		RequestBody:        reqBody,
-		ResponseStatus:     resp.Status,
-		ResponseStatusCode: resp.StatusCode,
-		ResponseHeaders:    resp.Header.Clone(),
-		ResponseBody:       respBody,
-		Timestamp:          time.Now(),
-		IsHTTPS:            isHTTPS,
+	parsedRequest, err := ParseRequest(r, reqBody)
+	if err != nil {
+		return 0, err
 	}
-	s.requests = append(s.requests, record)
-	s.nextID++
-	return record.ID
+
+	parsedResponse, err := ParseResponse(resp, respBody)
+	if err != nil {
+		return 0, err
+	}
+
+	record := &RequestRecord{
+		Request:     *parsedRequest,
+		Response:    *parsedResponse,
+		Timestamp:   time.Now(),
+		IsHTTPS:     isHTTPS,
+		RawRequest:  reqBody,
+		RawResponse: respBody,
+	}
+
+	if err = s.db.SaveRequest(record); err != nil {
+		return 0, err
+	}
+
+	return record.ID, nil
 }
 
-func (s *Storage) GetAll() []RequestRecord {
+func (s *Storage) GetAll() ([]*RequestRecord, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.requests
+	return s.db.GetAllRequests()
 }
 
-func (s *Storage) GetByID(id int) (*RequestRecord, bool) {
+func (s *Storage) GetByID(id int) (*RequestRecord, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	for _, r := range s.requests {
-		if r.ID == id {
-			return &r, true
-		}
-	}
-	return nil, false
+	return s.db.GetRequest(id)
 }
 
 func handleTunneling(w http.ResponseWriter, r *http.Request, storage *Storage) {
@@ -139,10 +136,15 @@ func proxyHandler(storage *Storage) http.HandlerFunc {
 			return
 		}
 
+		targetURL := "http://" + targetHost
+		if r.TLS != nil {
+			targetURL = "https://" + targetHost
+		}
 		targetPath := r.URL.Path
 		if r.URL.RawQuery != "" {
 			targetPath += "?" + r.URL.RawQuery
 		}
+		targetURL += targetPath
 
 		bodyBytes, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -153,7 +155,7 @@ func proxyHandler(storage *Storage) http.HandlerFunc {
 
 		req, err := http.NewRequest(
 			r.Method,
-			"http://"+targetHost+targetPath,
+			targetURL,
 			bytes.NewReader(bodyBytes),
 		)
 		if err != nil {
@@ -178,7 +180,7 @@ func proxyHandler(storage *Storage) http.HandlerFunc {
 			return
 		}
 
-		storage.Add(r, bodyBytes, resp, respBodyBytes, false)
+		storage.Add(r, bodyBytes, resp, respBodyBytes, r.TLS != nil)
 
 		for name, values := range resp.Header {
 			w.Header()[name] = values
@@ -192,14 +194,18 @@ func setupAPIRouter(storage *Storage) http.Handler {
 	r := mux.NewRouter()
 
 	r.HandleFunc("/requests", func(w http.ResponseWriter, r *http.Request) {
-		records := storage.GetAll()
+		records, err := storage.GetAll()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 		summaries := make([]map[string]interface{}, len(records))
 		for i, record := range records {
 			summaries[i] = map[string]interface{}{
 				"id":          record.ID,
-				"method":      record.Method,
-				"url":         record.URL,
-				"status_code": record.ResponseStatusCode,
+				"method":      record.Request.Method,
+				"url":         record.Request.Path,
+				"status_code": record.Response.Code,
 				"timestamp":   record.Timestamp.Format(time.RFC3339),
 				"is_https":    record.IsHTTPS,
 			}
@@ -214,21 +220,21 @@ func setupAPIRouter(storage *Storage) http.Handler {
 			http.Error(w, "Invalid ID", http.StatusBadRequest)
 			return
 		}
-		record, found := storage.GetByID(id)
-		if !found {
+		record, err := storage.GetByID(id)
+		if err != nil {
 			http.Error(w, "Request not found", http.StatusNotFound)
 			return
 		}
 		detail := map[string]interface{}{
 			"id":                   record.ID,
-			"method":               record.Method,
-			"url":                  record.URL,
-			"request_headers":      record.RequestHeaders,
-			"request_body":         base64.StdEncoding.EncodeToString(record.RequestBody),
-			"response_status":      record.ResponseStatus,
-			"response_status_code": record.ResponseStatusCode,
-			"response_headers":     record.ResponseHeaders,
-			"response_body":        base64.StdEncoding.EncodeToString(record.ResponseBody),
+			"method":               record.Request.Method,
+			"url":                  record.Request.Path,
+			"request_headers":      record.Request.Headers,
+			"request_body":         base64.StdEncoding.EncodeToString([]byte(record.Request.Body)),
+			"response_status":      record.Response.Message,
+			"response_status_code": record.Response.Code,
+			"response_headers":     record.Response.Headers,
+			"response_body":        base64.StdEncoding.EncodeToString([]byte(record.Response.Body)),
 			"timestamp":            record.Timestamp.Format(time.RFC3339),
 			"is_https":             record.IsHTTPS,
 		}
@@ -243,8 +249,8 @@ func setupAPIRouter(storage *Storage) http.Handler {
 			return
 		}
 
-		record, found := storage.GetByID(id)
-		if !found {
+		record, err := storage.GetByID(id)
+		if err != nil {
 			http.Error(w, "Request not found", http.StatusNotFound)
 			return
 		}
@@ -256,7 +262,7 @@ func setupAPIRouter(storage *Storage) http.Handler {
 				InsecureSkipVerify: true,
 			}
 
-			targetURL, err := url.Parse(record.URL)
+			targetURL, err := url.Parse(record.Request.Path)
 			if err != nil {
 				http.Error(w, "Invalid URL", http.StatusBadRequest)
 				return
@@ -270,16 +276,18 @@ func setupAPIRouter(storage *Storage) http.Handler {
 			defer conn.Close()
 
 			req, err := http.NewRequest(
-				record.Method,
-				record.URL,
-				bytes.NewReader(record.RequestBody),
+				record.Request.Method,
+				record.Request.Path,
+				bytes.NewReader([]byte(record.Request.Body)),
 			)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
 
-			req.Header = record.RequestHeaders.Clone()
+			for key, value := range record.Request.Headers {
+				req.Header.Set(key, value)
+			}
 			req.Header.Del("Proxy-Connection")
 			req.Header.Del("Proxy-Authorization")
 
@@ -297,16 +305,18 @@ func setupAPIRouter(storage *Storage) http.Handler {
 			defer resp.Body.Close()
 		} else {
 			req, err := http.NewRequest(
-				record.Method,
-				record.URL,
-				bytes.NewReader(record.RequestBody),
+				record.Request.Method,
+				record.Request.Path,
+				bytes.NewReader([]byte(record.Request.Body)),
 			)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
 
-			req.Header = record.RequestHeaders.Clone()
+			for key, value := range record.Request.Headers {
+				req.Header.Set(key, value)
+			}
 			req.Header.Del("Proxy-Connection")
 			req.Header.Del("Proxy-Authorization")
 
@@ -349,15 +359,22 @@ func setupAPIRouter(storage *Storage) http.Handler {
 			return
 		}
 
-		record, found := storage.GetByID(id)
-		if !found {
+		record, err := storage.GetByID(id)
+		if err != nil {
 			http.Error(w, "Request not found", http.StatusNotFound)
 			return
 		}
 
+		hiddenParams, err := scanForHiddenParams(record)
+		if err != nil {
+			http.Error(w, "Error scanning for parameters", http.StatusInternalServerError)
+			return
+		}
+
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":  "headers scanned",
-			"headers": record.RequestHeaders,
+			"status":        "scan completed",
+			"headers":       record.Request.Headers,
+			"hidden_params": hiddenParams,
 		})
 	}).Methods("GET")
 
@@ -383,7 +400,10 @@ func generateCertificates() {
 func main() {
 	generateCertificates()
 
-	storage := &Storage{}
+	storage, err := NewStorage()
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	cert, err := tls.LoadX509KeyPair("certs/cert.pem", "certs/cert.key")
 	caCert, err := os.ReadFile("certs/ca.crt")

@@ -13,7 +13,7 @@ FROM debian:bookworm-slim
 WORKDIR /app
 
 RUN apt-get update && \
-    apt-get install -y openssl ca-certificates && \
+    apt-get install -y openssl ca-certificates postgresql-client && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/proxy .
